@@ -1,0 +1,148 @@
+type token_id is nat;
+type auction_id is nat;
+type bid is record
+  bidder : address;
+  amount : tez;
+end;
+
+type auction is record
+  token : token_id;
+  highest_bid : bid;
+  end_time : timestamp;
+end;
+
+type token is record
+  id : token_id;
+  owner : address;
+  artist : address;
+  image_url : string;
+  metadata : map(string, string); // Additional metadata about the token
+  royalties : nat; // The royalty percentage for the artist, represented as an integer between 0 and 100
+end;
+
+type storage is record
+  tokens : map(token_id, token);
+  auctions : map(auction_id, auction);
+  minter : address; // The address that's allowed to mint new tokens
+end;
+
+type mint_params is token;
+
+type transfer_params is record
+  token : token_id;
+  to : address;
+end;
+
+type start_auction_params is record
+  token : token_id;
+  start_price : tez;
+  end_time : timestamp;
+end;
+
+type bid_params is record
+  auction : auction_id;
+  amount : tez;
+end;
+
+type end_auction_params is auction_id;
+
+type action is
+  | Mint of mint_params
+
+  type end_auction_params is auction_id;
+
+function end_auction (const eap : end_auction_params; const storage : storage) : (list(operation), storage) is
+  block {
+    const auction_opt : option(auction) = Map.find_opt(eap, storage.auctions);
+    case auction_opt of
+      None -> failwith("Auction does not exist")
+    | Some(auction) ->
+        if now < auction.end_time
+        then failwith("Auction has not ended yet")
+        else skip;
+        const token_opt : option(token) = Map.find_opt(auction.token, storage.tokens);
+        case token_opt of
+          None -> failwith("Token does not exist")
+        | Some(token) ->
+            if sender <> token.owner
+            then failwith("Only the owner can end the auction")
+            else skip;
+            const new_token : token = { token with owner = auction.highest_bid.bidder };
+            const tokens : map(token_id, token) = Map.update(auction.token, Some(new_token), storage.tokens);
+            const auctions : map(auction_id, auction) = Map.remove(eap, storage.auctions);
+            const op : operation = Tezos.transaction(auction.highest_bid.amount, 0tz, token.owner);
+        end
+  } with (list [op], { storage with tokens = tokens; auctions = auctions })
+
+  | Transfer of transfer_params
+  | StartAuction of start_auction_params
+  | Bid on bid_params
+  | EndAuction of end_auction_params;
+
+function mint (const mp : mint_params; const storage : storage) : storage is
+  block {
+    if sender <> storage.minter
+    then failwith("Only the minter can mint new tokens")
+    else skip;
+    if Map.mem(mp.id, storage.tokens)
+    then failwith("Token already exists")
+    else skip;
+    if mp.royalties < 0n or mp.royalties > 100n
+    then failwith("Royalties must be between 0 and 100")
+    else skip;
+    const tokens : map(token_id, token) = Map.update(mp.id, Some(mp), storage.tokens);
+  } with { storage with tokens = tokens }
+
+function transfer (const tp : transfer_params; const storage : storage) : storage is
+  block {
+    const token_opt : option(token) = Map.find_opt(tp.token, storage.tokens);
+    case token_opt of
+      None -> failwith("Token does not exist")
+    | Some(token) ->
+        if sender <> token.owner
+        then failwith("Only the owner can transfer the token")
+        else skip;
+        const new_token : token = { token with owner = tp.to };
+        const tokens : map(token_id, token) = Map.update(tp.token, Some(new_token), storage.tokens);
+    end
+  } with { storage with tokens = tokens }
+
+function start_auction (const sap : start_auction_params; const storage : storage) : storage is
+  block {
+    const token_opt : option(token) = Map.find_opt(sap.token, storage.tokens);
+    case token_opt of
+      None -> failwith("Token does not exist")
+    | Some(token) ->
+        if sender <> token.owner
+        then failwith("Only the owner can start an auction")
+        else skip;
+        const auction : auction = { token = sap.token; highest_bid = { bidder = (null : option(address)); amount = 0tz }; end_time = sap.end_time };
+        const auctions : map(auction_id, auction) = Map.update(sap.token, Some(auction), storage.auctions);
+    end
+  } with { storage with auctions = auctions }
+
+function bid (const bp : bid_params; const storage : storage) : storage is
+  block {
+    const auction_opt : option(auction) = Map.find_opt(bp.auction, storage.auctions);
+    case auction_opt of
+      None -> failwith("Auction does not exist")
+    | Some(auction) ->
+        if now >= auction.end_time
+        then failwith("Auction has ended")
+        else skip;
+        if bp.amount <= auction.highest_bid.amount
+        then failwith("Bid must be higher than the current highest bid")
+        else skip;
+        const new_auction : auction = { auction with highest_bid = { bidder = Some(sender); amount = bp.amount } };
+        const auctions : map(auction_id, auction) = Map.update(bp.auction, Some(new_auction), storage.auctions);
+    end
+  } with { storage with auctions = auctions }
+
+function main (const action : action; const storage : storage) : (list(operation), storage) is
+  case action of
+    Mint(mp) -> (nil : list(operation)), mint(mp, storage)
+  | Transfer(tp) -> (nil : list(operation)), transfer(tp, storage)
+  | StartAuction(sap) -> (nil : list(operation)), start_auction(sap, storage)
+  | Bid(bp) -> (nil : list(operation)), bid(bp, storage)
+  | EndAuction(eap) -> end_auction(eap, storage)
+  end;
